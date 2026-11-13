@@ -10,7 +10,7 @@
 #   - push 到 ltx: 直接构建.
 #   - workflow_dispatch: 手动跑一次.
 #
-# 镜像: ghcr.io/<owner>/<repo>:ltx 与 :ltx-<sha>.
+# 镜像: ghcr.io/<owner>/<repo>:latest 与 :ltx-<sha>.
 # 若需 arm64, 把 platforms 改成 linux/amd64,linux/arm64 (QEMU, 构建更慢).
 
 name: LTX image
@@ -94,7 +94,7 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=ltx
+            type=raw,value=latest
             type=sha,prefix=ltx-
 
       - name: Build and push
