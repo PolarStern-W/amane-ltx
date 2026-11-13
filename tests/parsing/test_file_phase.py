@@ -23,6 +23,7 @@ from amane.parsing import (
         ("/media/HEYZO-1234.mp4", ContentType.UNCENSORED, None),
         ("/media/MD0165-1.mp4", ContentType.CHINESE, None),
         ("/media/MIDV-123-U.mp4", ContentType.CENSORED, Mosaic.CRACKED),
+        ("/media/MIDV-123-LTX.mp4", ContentType.CENSORED, Mosaic.LTX),
         ("/media/MIDV-123-无码.mp4", ContentType.CENSORED, Mosaic.UNCENSORED),
         ("/media/无码/MIDV-123.mp4", ContentType.CENSORED, Mosaic.UNCENSORED),
     ],
@@ -58,6 +59,7 @@ def test_shows_uncensored(mosaic: Mosaic | None, content_type: ContentType | Non
         (Mosaic.UNCENSORED, ContentType.CENSORED, MosaicNature.UNCENSORED),
         (Mosaic.CRACKED, ContentType.UNCENSORED, MosaicNature.CRACKED),
         (Mosaic.LEAKED, ContentType.CENSORED, MosaicNature.LEAKED),
+        (Mosaic.LTX, ContentType.CENSORED, MosaicNature.LTX),
         (None, ContentType.CHINESE, None),
         (None, None, None),
     ],
@@ -89,11 +91,12 @@ def test_max_definition(values: tuple[str | None, ...], expected: str | None) ->
 def test_summarize_file_phases_or_across_files() -> None:
     cracked: FilePhase = {"mosaic": Mosaic.CRACKED, "has_subtitle": True, "definition": "1080p"}
     leaked: FilePhase = {"mosaic": Mosaic.LEAKED, "has_subtitle": False, "definition": "4K"}
-    summary = summarize_file_phases((cracked, leaked), ContentType.CENSORED)
+    ltx: FilePhase = {"mosaic": Mosaic.LTX, "has_subtitle": False, "definition": "720p"}
+    summary = summarize_file_phases((cracked, leaked, ltx), ContentType.CENSORED)
     assert summary.censored is True
     assert summary.uncensored is False
     assert summary.has_subtitle is True
-    assert summary.mosaics == (Mosaic.CRACKED, Mosaic.LEAKED)
+    assert summary.mosaics == (Mosaic.CRACKED, Mosaic.LEAKED, Mosaic.LTX)
     assert summary.definition == "4K"
 
 

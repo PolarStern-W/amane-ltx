@@ -3618,6 +3618,7 @@ export const HotSettingsSchema = {
                     cracked: 'top_left',
                     definition: 'top_left',
                     leaked: 'top_left',
+                    ltx: 'top_left',
                     subtitle: 'top_left',
                     uncensored: 'top_left'
                 }
@@ -6558,7 +6559,8 @@ export const MosaicSchema = {
     enum: [
         'uncensored',
         'cracked',
-        'leaked'
+        'leaked',
+        'ltx'
     ],
     title: 'Mosaic',
     description: '马赛克标记; 有码是条目类型, 不在此列.'
@@ -11047,6 +11049,7 @@ export const WatermarkKindSchema = {
         'uncensored',
         'cracked',
         'leaked',
+        'ltx',
         'definition'
     ],
     title: 'WatermarkKind',

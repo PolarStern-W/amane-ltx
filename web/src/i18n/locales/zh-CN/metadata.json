@@ -47,7 +47,8 @@
     "mosaics": {
       "uncensored": "无码",
       "cracked": "破解",
-      "leaked": "流出"
+      "leaked": "流出",
+      "ltx": "LTX"
     }
   },
   "filePhase": {
@@ -55,7 +56,8 @@
     "censored": "有码",
     "uncensored": "无码",
     "cracked": "破解",
-    "leaked": "流出"
+    "leaked": "流出",
+    "ltx": "LTX"
   },
   "columns": {
     "number": "番号",

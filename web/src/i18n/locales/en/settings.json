@@ -802,12 +802,13 @@
       },
       "corners": {
         "label": "Watermark position",
-        "description": "Multiple in the same corner stack in order: subtitle → uncensored → cracked → leaked → resolution",
+        "description": "Multiple in the same corner stack in order: subtitle → uncensored → cracked → leaked → LTX → resolution",
         "options": {
           "subtitle": "Subtitle",
           "uncensored": "Uncensored",
           "cracked": "Cracked",
           "leaked": "Leaked",
+          "ltx": "LTX",
           "definition": "Resolution"
         },
         "$": {

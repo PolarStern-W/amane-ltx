@@ -47,7 +47,8 @@
     "mosaics": {
       "uncensored": "Uncensored",
       "cracked": "Cracked",
-      "leaked": "Leaked"
+      "leaked": "Leaked",
+      "ltx": "LTX"
     }
   },
   "filePhase": {
@@ -55,7 +56,8 @@
     "censored": "CEN",
     "uncensored": "U",
     "cracked": "CRACK",
-    "leaked": "LEAK"
+    "leaked": "LEAK",
+    "ltx": "LTX"
   },
   "columns": {
     "number": "Number",

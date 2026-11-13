@@ -215,7 +215,7 @@ _SCALE_MAX = 0.25
 _STAMP_MIN_HEIGHT = 16
 
 _FIXED_KINDS: frozenset[str] = frozenset(
-    (WatermarkKind.SUBTITLE, WatermarkKind.UNCENSORED, WatermarkKind.CRACKED, WatermarkKind.LEAKED)
+    (WatermarkKind.SUBTITLE, WatermarkKind.UNCENSORED, WatermarkKind.CRACKED, WatermarkKind.LEAKED, WatermarkKind.LTX)
 )
 _RIGHT_CORNERS = frozenset((WatermarkCorner.TOP_RIGHT, WatermarkCorner.BOTTOM_RIGHT))
 _BOTTOM_CORNERS = frozenset((WatermarkCorner.BOTTOM_LEFT, WatermarkCorner.BOTTOM_RIGHT))
@@ -228,7 +228,7 @@ def _stamp_stems(
     mosaic: Mosaic | None,
     definition: str | None,
 ) -> list[str]:
-    """相位 → PNG 主干, 顺序: 中字 / 无码 / 破解 / 流出 / 分辨率."""
+    """相位 → PNG 主干, 顺序: 中字 / 无码 / 破解 / 流出 / LTX / 分辨率."""
     stems: list[str] = []
     if has_subtitle:
         stems.append("subtitle")
@@ -238,6 +238,8 @@ def _stamp_stems(
         stems.append("cracked")
     elif mosaic is Mosaic.LEAKED:
         stems.append("leaked")
+    elif mosaic is Mosaic.LTX:
+        stems.append("ltx")
     if definition:
         stems.append(definition.casefold())
     return stems

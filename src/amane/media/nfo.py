@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import aiofiles
 import structlog
 
+from ..parsing import Mosaic
 from ..utils.text import strip_illegal_xml_chars
 
 if TYPE_CHECKING:
@@ -50,7 +51,7 @@ def _title_with_number(number: str, title: str) -> str:
     return f"{number} {text}".strip()
 
 
-async def write_nfo(metadata: Metadata, nfo_path: Path) -> bool:
+async def write_nfo(metadata: Metadata, nfo_path: Path, *, mosaic: Mosaic | None = None) -> bool:
     try:
         nfo_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -114,6 +115,11 @@ async def write_nfo(metadata: Metadata, nfo_path: Path) -> bool:
                 if tag:
                     code.write(f"  <tag>{_escape_xml(tag)}</tag>\n")
                     code.write(f"  <genre>{_escape_xml(tag)}</genre>\n")
+
+        if mosaic is Mosaic.LTX:
+            # 文件相位 LTX 单独进 NFO, 供 Emby / Jellyfin / Kodi 按 LTX 标签 / 类型筛选.
+            code.write("  <tag>LTX</tag>\n")
+            code.write("  <genre>LTX</genre>\n")
 
         if metadata.poster_url:
             code.write(f"  <poster>{_escape_xml(metadata.poster_url)}</poster>\n")

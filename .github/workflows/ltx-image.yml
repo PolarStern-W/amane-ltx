@@ -1,0 +1,110 @@
+# 个人 fork 的 LTX 流水线: 定时同步上游 -> 构建并推送镜像.
+#
+# 约定:
+#   - `main`   = 上游 sqzw-x/amane 的纯镜像 (不含本地提交, 便于 --ff-only).
+#   - `ltx`    = 默认分支, main + LTX 改动 + 本工作流.
+#   - 仓库 Settings > Actions > General > Workflow permissions 需为 "Read and write".
+#
+# 触发:
+#   - schedule: 每 6 小时拉一次上游并重建 (GitHub cron 用 UTC, 且有数分钟延迟, 非严格实时).
+#   - push 到 ltx: 直接构建.
+#   - workflow_dispatch: 手动跑一次.
+#
+# 镜像: ghcr.io/<owner>/<repo>:ltx 与 :ltx-<sha>.
+# 若需 arm64, 把 platforms 改成 linux/amd64,linux/arm64 (QEMU, 构建更慢).
+
+name: LTX image
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [ltx]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  sync:
+    name: sync upstream
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fast-forward main from upstream
+        run: |
+          git config user.name "ltx-bot"
+          git config user.email "ltx-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/sqzw-x/amane.git
+          git fetch upstream --prune
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+          git checkout main
+          git merge --ff-only upstream/main
+          git push origin main
+
+      - name: Merge main into ltx
+        id: ltxmerge
+        continue-on-error: true
+        run: |
+          git checkout -B ltx origin/ltx
+          git merge main --no-edit
+
+      - name: Push ltx
+        if: steps.ltxmerge.outcome == 'success'
+        run: git push origin ltx
+
+      - name: Report conflict
+        if: steps.ltxmerge.outcome == 'failure'
+        run: |
+          git merge --abort || true
+          echo "::error::ltx 与上游冲突, 请本地 git merge upstream/main 解决后 push"
+          exit 1
+
+  build:
+    name: build and push
+    needs: [sync]
+    # sync 被跳过 (push 事件) 或成功时才构建; 冲突失败则不构建.
+    if: always() && (needs.sync.result == 'success' || needs.sync.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ltx
+
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=ltx
+            type=sha,prefix=ltx-
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

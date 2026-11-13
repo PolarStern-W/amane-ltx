@@ -7,6 +7,7 @@ import pytest
 
 from amane.db.models import Metadata
 from amane.media import write_nfo
+from amane.parsing import Mosaic
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -65,6 +66,16 @@ async def test_write_nfo_plot_is_plain_text(tmp_path: Path):
     root = ET.fromstring(content)
     assert root.findtext("plot") == "结尾 ]]> 之后 & <标签>\n\n第二段"
     assert root.findtext("outline") == root.findtext("plot")
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_write_nfo_ltx_tag(tmp_path: Path, metadata: Metadata):
+    """LTX 文件标记在整理时写入 NFO 的 tag 与 genre, 供媒体库筛选."""
+    nfo_path = tmp_path / "MIDV-123.nfo"
+    assert await write_nfo(metadata, nfo_path, mosaic=Mosaic.LTX) is True
+    content = nfo_path.read_text(encoding="utf-8")
+    assert "<tag>LTX</tag>" in content
+    assert "<genre>LTX</genre>" in content
 
 
 TITLE_CASES: list[tuple[str, str, str]] = [

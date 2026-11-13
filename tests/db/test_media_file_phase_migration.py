@@ -103,6 +103,55 @@ def test_ltx_media_file_mosaic_reprojected_from_path(tmp_path: Path) -> None:
     engine.dispose()
 
 
+def test_ltx_media_file_mosaic_split_from_cracked(tmp_path: Path) -> None:
+    """文件名带 -LTX 的行从破解重算为 LTX 标记; 谓词之外的行保持原值, 重跑结果相同."""
+    db_path = tmp_path / "migrate.db"
+    cfg = alembic_config(db_path)
+
+    previous, target = "e06def65f72a", "eb1e988cf252"
+    command.upgrade(cfg, previous)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        lib_id = _seed_library(conn)
+        for path, mosaic in [
+            ("/media/SNIS-576-LTX/489155.com@SNIS-576-LTX.mp4", "CRACKED"),
+            ("/media/MIDV-123-LTX.mp4", "CRACKED"),
+            ("/media/MIDV-123-LTX-4K.mp4", "CRACKED"),
+            # 目录名带后缀不算文件名标记
+            ("/media/SNIS-576-LTX/video.mp4", None),
+            # 谓词之外的行保持原值
+            ("/media/MIDV-123.mp4", "LEAKED"),
+            # 纯破解标记保持破解
+            ("/media/MIDV-123-破解.mp4", "CRACKED"),
+        ]:
+            conn.execute(
+                text(
+                    "INSERT INTO media_files (path, status, library_id, created_at, updated_at, mosaic) "
+                    "VALUES (:path, 'PENDING', :lib, '2026-01-01 00:00:00', '2026-01-01 00:00:00', :mosaic)"
+                ),
+                {"path": path, "lib": lib_id, "mosaic": mosaic},
+            )
+
+    command.upgrade(cfg, target)
+
+    expected = {
+        "/media/SNIS-576-LTX/489155.com@SNIS-576-LTX.mp4": "LTX",
+        "/media/MIDV-123-LTX.mp4": "LTX",
+        "/media/MIDV-123-LTX-4K.mp4": "LTX",
+        "/media/SNIS-576-LTX/video.mp4": None,
+        "/media/MIDV-123.mp4": "LEAKED",
+        "/media/MIDV-123-破解.mp4": "CRACKED",
+    }
+    assert _mosaics(engine) == expected
+
+    # downgrade 留空 (数据迁移不可逆), 再次升级不改变已写入的值
+    command.downgrade(cfg, previous)
+    command.upgrade(cfg, target)
+    assert _mosaics(engine) == expected
+    engine.dispose()
+
+
 def test_media_file_phase_columns_backfill_from_path(tmp_path: Path) -> None:
     db_path = tmp_path / "migrate.db"
     cfg = alembic_config(db_path)

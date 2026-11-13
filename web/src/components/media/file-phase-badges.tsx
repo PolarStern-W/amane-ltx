@@ -5,6 +5,7 @@ import {
   IconDroplet,
   IconEye,
   IconLockOpen,
+  IconPackage,
   IconSubtitles,
 } from "@tabler/icons-react";
 import type { TFunction } from "i18next";
@@ -25,7 +26,7 @@ export type FilePhaseLike = {
   definition?: string | null;
 };
 
-type PhaseChipKey = "sub" | "cen" | "u" | "crack" | "leak" | "def";
+type PhaseChipKey = "sub" | "cen" | "u" | "crack" | "leak" | "ltx" | "def";
 
 type PhaseChip = { key: PhaseChipKey; label: string };
 
@@ -54,6 +55,11 @@ const PHASE_CHIP = exhaustiveRecord<PhaseChipKey>()({
     color: "teal",
     Icon: IconDroplet,
     iconColor: "var(--mantine-color-teal-3)",
+  },
+  ltx: {
+    color: "cyan",
+    Icon: IconPackage,
+    iconColor: "var(--mantine-color-cyan-4)",
   },
   def: {
     color: "blue",
@@ -92,6 +98,9 @@ function mosaicChips(phase: FilePhaseLike, t: TFunction<"metadata">): PhaseChip[
   if (hasMosaic(phase, "leaked")) {
     chips.push({ key: "leak", label: t("filePhase.leaked") });
   }
+  if (hasMosaic(phase, "ltx")) {
+    chips.push({ key: "ltx", label: t("filePhase.ltx") });
+  }
   return chips;
 }
 
@@ -124,7 +133,7 @@ interface FilePhaseBadgesProps {
   size?: "xs" | "sm";
 }
 
-/** 条目相位与文件行共用: 有码 / 无码取条目相位, 破解 / 流出 / 中字 / 分辨率取文件行. */
+/** 条目相位与文件行共用: 有码 / 无码取条目相位, 破解 / 流出 / LTX / 中字 / 分辨率取文件行. */
 export function FilePhaseBadges({ phase, size = "xs" }: FilePhaseBadgesProps) {
   const { t } = useTranslation("metadata");
   if (phase == null) return null;

@@ -3287,7 +3287,7 @@ export type MetadataUserTagsResponse = {
  *
  * 马赛克标记; 有码是条目类型, 不在此列.
  */
-export type Mosaic = 'uncensored' | 'cracked' | 'leaked';
+export type Mosaic = 'uncensored' | 'cracked' | 'leaked' | 'ltx';
 
 /**
  * MoveMode
@@ -5918,7 +5918,7 @@ export type WatermarkCorner = 'top_left' | 'top_right' | 'bottom_left' | 'bottom
  *
  * 整理落盘封面角标类别. 分辨率共用 definition, 不论 4K/1080p.
  */
-export type WatermarkKind = 'subtitle' | 'uncensored' | 'cracked' | 'leaked' | 'definition';
+export type WatermarkKind = 'subtitle' | 'uncensored' | 'cracked' | 'leaked' | 'ltx' | 'definition';
 
 /**
  * WorkerConfig
