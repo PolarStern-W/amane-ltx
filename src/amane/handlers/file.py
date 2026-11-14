@@ -385,8 +385,20 @@ def _image_products(
     return products
 
 
+@dataclass(frozen=True, slots=True)
+class _RebuildPlan:
+    """一个条目的清理计划: 留到该条目真正落盘前才执行, 避免整库范围先删后写."""
+
+    number: str
+    directories: tuple[Path, ...]
+    extrafanart_dirs: tuple[Path, ...]
+    keep: frozenset[Path]
+    expected: frozenset[Path]
+
+
 async def _item_needs_rebuild(
     expected: set[Path],
+    products: set[Path],
     keep: set[Path],
     directories: Sequence[Path],
     metadata: Metadata,
@@ -399,6 +411,8 @@ async def _item_needs_rebuild(
     """条目是否需要重建: 有残留、缺产物、或产物比 metadata / 源资源旧.
 
     残留判定直接复用 dry-run 的清理候选; 因此「目录里多了上一轮的文件」一定算变化.
+    ``expected`` 含视频落点, 只用于判「缺文件」; 新旧比较只看 ``products`` (NFO / 链接 /
+    图片 / 剧照) — 视频不会因整理被重写, 其 mtime 是下载时间, 混进来会让每个条目都判成过期.
     """
     if not expected:
         return True
@@ -411,8 +425,13 @@ async def _item_needs_rebuild(
     )
     if any(path.suffix.casefold() in _MANAGED_SUFFIXES for path in stale):
         return True
-    oldest: float | None = None
     for path in expected:
+        try:
+            path.stat()
+        except OSError:
+            return True
+    oldest: float | None = None
+    for path in products:
         try:
             mtime = path.stat().st_mtime
         except OSError:
@@ -711,16 +730,17 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
         live: list[MediaFile],
         library: Library,
         payload: OrganizePayload,
-    ) -> list[MediaFile]:
-        """重建前按条目清掉上一轮产物; 没有变化的条目整条跳过.
+    ) -> tuple[list[MediaFile], dict[int, _RebuildPlan]]:
+        """筛出需要重建的条目, 并为每个条目准备清理计划; 没有变化的条目整条跳过.
 
-        先按条目整体处理, 避免多 CD 条目逐文件清理时互相删掉对方产物. ``keep`` 收集同条目
-        所有仍在磁盘上的成员源文件, 以及本轮不会重写的 NFO / 预告片; ``expected`` 是本轮应该
-        写出的文件, 用来判断「缺了什么、多了什么、哪个比源旧」. 判为未变的条目不再进入整理循环.
+        ``keep`` 收集同条目所有仍在磁盘上的成员源文件, 以及本轮不会重写的 NFO / 预告片;
+        ``expected`` 是本轮应该写出的全部文件; ``products`` 是其中会被重写的那部分.
+        清理计划留到该条目真正落盘前才执行 — 整库范围先删后写会让中途取消留下空目录.
         """
         metadata_ids = sorted({mf.metadata_id for mf in live if mf.metadata_id is not None})
+        plans: dict[int, _RebuildPlan] = {}
         if not metadata_ids:
-            return live
+            return live, plans
         members_by_metadata: dict[int, list[MediaFile]] = {}
         for member in await self._repo.list_media_files(metadata_ids=metadata_ids, limit=None):
             if member.metadata_id is not None:
@@ -738,6 +758,7 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                 continue
             keep: set[Path] = set()
             expected: set[Path] = set()
+            products: set[Path] = set()
             directories: list[Path] = []
             extrafanart_dirs: list[Path] = []
             live_paths: ResolvedPaths | None = None
@@ -762,9 +783,9 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                         _resolved(video_dest(paths.video.parent, paths.video.stem, source, suffix=paths.video.suffix))
                     )
                     if paths.link is not None:
-                        expected.add(_resolved(paths.link))
+                        products.add(_resolved(paths.link))
                     if write_nfo:
-                        expected.add(_resolved(paths.nfo))
+                        products.add(_resolved(paths.nfo))
                     live_paths = live_paths or paths
                 if paths.link is not None:
                     directories.append(paths.link.parent)
@@ -778,7 +799,7 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                     extrafanart_dirs.append(paths.extrafanart_dir)
             sources, stills = await self._product_sources(metadata, kinds)
             if live_paths is not None:
-                expected.update(
+                products.update(
                     _image_products(
                         live_paths,
                         sources,
@@ -786,8 +807,19 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                         config=self._config,
                     )
                 )
+            expected.update(products)
+            if live_paths is not None and stills:
+                extrafanart_vars = live_paths.context
+                template = library.extrafanart_name_template or EXTRAFANART_NAME_TEMPLATE_DEFAULT
+                for name in render_extrafanart_names(template, extrafanart_vars, len(stills)):
+                    expected.add(_resolved(live_paths.extrafanart_dir / name))
+            if not expected:
+                # 库里没有可落盘的成员 (换版后旧行指向的文件已消失): 什么都不写, 更不能清目录.
+                unchanged.add(metadata_id)
+                continue
             if not await _item_needs_rebuild(
                 expected,
+                products,
                 keep,
                 directories,
                 metadata,
@@ -798,22 +830,16 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
             ):
                 unchanged.add(metadata_id)
                 continue
-            removed = await _purge_item_dirs(
-                directories,
-                metadata.number,
-                keep | expected,
-                extrafanart_dirs=extrafanart_dirs,
-                library_root=Path(library.path),
+            plans[metadata_id] = _RebuildPlan(
+                number=metadata.number,
+                directories=tuple(dict.fromkeys(_resolved(directory) for directory in directories)),
+                extrafanart_dirs=tuple(dict.fromkeys(_resolved(directory) for directory in extrafanart_dirs)),
+                keep=frozenset(keep),
+                expected=frozenset(expected),
             )
-            if removed:
-                logger.info(
-                    "organize rebuild cleaned stale products",
-                    number=metadata.number,
-                    removed=[str(path) for path in removed],
-                )
         if unchanged:
             logger.info("organize rebuild skipped unchanged items", count=len(unchanged))
-        return [mf for mf in live if mf.metadata_id not in unchanged]
+        return [mf for mf in live if mf.metadata_id not in unchanged], plans
 
     async def handle(self, payload: OrganizePayload) -> TaskResult[OrganizeResult]:
         library = await self._repo.get_library(payload.library_id)
@@ -876,9 +902,10 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
         # 只有移动方式会移走源文件, 复制 / 硬链接 / 符号链接不腾空目录.
         prune_candidates: set[Path] = set()
         collect_prune = payload.prune_empty_dirs and library.move_mode is MoveMode.MOVE
+        plans: dict[int, _RebuildPlan] = {}
         if payload.rebuild and live:
             before = len(live)
-            live = await self._rebuild_items(live, library, payload)
+            live, plans = await self._rebuild_items(live, library, payload)
             # 内容没变的条目整条跳过, 不重写任何产物; 计数并入 skipped 让用户看到「没动」.
             skipped += before - len(live)
         total = len(live)
@@ -889,16 +916,20 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
             for i, media_file in enumerate(live, start=1):
                 path_str = media_file.path
                 file_path = Path(path_str)
-                if media_file.metadata_id is None:
+                metadata_id = media_file.metadata_id
+                if metadata_id is None:
                     skipped += 1
                     await self.report_progress(i, total, file_path.name)
                     continue
 
-                metadata = await self._repo.get_metadata(media_file.metadata_id)
+                metadata = await self._repo.get_metadata(metadata_id)
                 if metadata is None:
                     skipped += 1
                     await self.report_progress(i, total, file_path.name)
                     continue
+
+                # 旧产物在落盘成功后才清: 冲突或失败时保留原样, 不会留下空目录.
+                plan = plans.get(metadata_id)
 
                 write_nfo = library.write_nfo if payload.write_nfo is None else payload.write_nfo
                 copy_resources = library.copy_resources if payload.copy_resources is None else payload.copy_resources
@@ -924,6 +955,22 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                 match fop_result.outcome:
                     case PlaceOutcome.PLACED:
                         organized += 1
+                        if plan is not None:
+                            plans.pop(metadata_id, None)
+                            removed = await _purge_item_dirs(
+                                plan.directories,
+                                plan.number,
+                                set(plan.keep | plan.expected),
+                                extrafanart_dirs=plan.extrafanart_dirs,
+                                library_root=library_root,
+                            )
+                            if removed:
+                                logger.info(
+                                    "organize rebuild cleaned stale products",
+                                    number=plan.number,
+                                    expected=len(plan.expected),
+                                    removed=[str(item) for item in removed],
+                                )
                         if collect_prune:
                             prune_candidates.update(ancestor_dirs(file_path, library_root=library_root))
                         # 字幕冲突的 path 是留在原处的那条字幕, 不是视频源路径.
