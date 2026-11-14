@@ -13,7 +13,7 @@ from ..db.models import Library, MediaFile
 from ..db.repo_types import MediaFileUpdates
 from ..enums import ActorGender, DownloadableResource, LinkMode
 from ..library import MEDIA_EXTENSIONS, LibraryFileKind, LibraryScan, ancestor_dirs, prune_empty_dirs
-from ..library.rules import is_in_trash
+from ..library.rules import TRASH_DIRNAME, is_in_trash
 from ..media import ResourceStore, allows_poster_crop, apply_cover_watermarks_from_info, crop_poster
 from ..media import write_nfo as write_nfo_file
 from ..media.resource_store import internal_url_hash
@@ -340,85 +340,77 @@ def _starts_with_number(name: str, number: str) -> bool:
     return re.match(rf"{re.escape(number)}(?![0-9])", name, re.IGNORECASE) is not None
 
 
-def _belongs_to_item(name: str, number: str) -> bool:
-    """名字是否可能由本条目生成: 番号前缀, 或固定产物名 / 隐藏文件."""
-    if name.startswith("."):
-        return True
-    if name.casefold() in _FIXED_PRODUCT_NAMES:
-        return True
-    return _starts_with_number(name, number)
-
-
 def _is_dedicated_dir(directory: Path, number: str) -> bool:
-    """目录是否只放本条目: 默认模板是 ``{studio}/{number}/``, 目录名就是番号.
+    """目录名是否就是本条目: 只有默认模板 ``{studio}/{number}/`` 这种按番号命名的目录才算.
 
-    用户把条目摊平到工作室目录时, 目录里会有别的番号, 这时只删本条目番号前缀的文件,
-    不整目录清空, 避免误删同目录其它条目.
+    摊平到工作室目录时目录里放着别的番号, 一律只删番号前缀文件; 目录里还有子目录时,
+    那些子目录可能是别的条目, 既不递归也不整目录清空.
     """
     folded = number.casefold()
     name = directory.name.casefold()
-    if name == folded or name.startswith(f"{folded} "):
-        return True
-    try:
-        children = list(directory.iterdir())
-    except OSError:
-        return False
-    return all(child.is_dir() or _belongs_to_item(child.name, number) for child in children)
+    return name == folded or name.startswith(f"{folded} ")
 
 
-def _remove_tree(directory: Path, keep: set[Path]) -> list[Path]:
-    removed: list[Path] = []
-    try:
-        children = list(directory.iterdir())
-    except OSError as exc:
-        logger.warning("rebuild cleanup skipped", path=str(directory), error=str(exc))
-        return removed
-    for child in children:
-        if _resolved(child) in keep:
-            continue
-        if child.is_dir():
-            removed.extend(_remove_tree(child, keep))
-            continue
-        try:
-            child.unlink(missing_ok=True)
-            removed.append(child)
-        except OSError as exc:
-            logger.warning("rebuild cleanup skipped", path=str(child), error=str(exc))
-    return removed
+def _same_path(left: Path, right: Path) -> bool:
+    return path_is_under(left, right) and path_is_under(right, left)
 
 
 @in_thread
-def _purge_item_dirs(directories: Sequence[Path], number: str, keep: set[Path]) -> list[Path]:
-    """清掉这些目录里不属于本轮的旧产物; 返回被删的路径.
+def _purge_item_dirs(
+    directories: Sequence[Path],
+    number: str,
+    keep: set[Path],
+    *,
+    extrafanart_dirs: Sequence[Path] = (),
+    library_root: Path | None = None,
+) -> list[Path]:
+    """清掉这些目录里能确定属于本条目的旧产物; 返回被删的路径.
 
-    ``keep`` 由调用方按条目收集: 仍在磁盘上的成员源文件, 以及本轮不会重写的 NFO / 预告片.
+    只删两类普通文件: 名字以番号开头的 (换版后多出来的 CD / 集数文件、旧 NFO 与链接),
+    以及条目独占目录里的固定产物名; 剧照目录里的文件可整体清理. 不递归子目录、不删目录,
+    库根与回收目录一律跳过, ``keep`` 里的路径始终保留 — 共享祖先目录因此不会被清空.
     """
     removed: list[Path] = []
     seen: set[Path] = set()
-    for directory in directories:
+    trash_root = library_root / TRASH_DIRNAME if library_root is not None else None
+
+    def protected(path: Path) -> bool:
+        if _resolved(path) in keep:
+            return True
+        if library_root is not None:
+            if _same_path(path, library_root):
+                return True
+            if trash_root is not None and path_is_under(path, trash_root):
+                return True
+        return False
+
+    def purge(directory: Path, *, any_file: bool) -> None:
         key = _resolved(directory)
-        if key in seen or not directory.is_dir():
-            continue
+        if key in seen or not directory.is_dir() or protected(directory):
+            return
         seen.add(key)
-        dedicated = _is_dedicated_dir(directory, number)
+        dedicated = any_file or _is_dedicated_dir(directory, number)
         try:
             children = list(directory.iterdir())
         except OSError as exc:
             logger.warning("rebuild cleanup skipped", path=str(directory), error=str(exc))
-            continue
+            return
         for child in children:
-            if _resolved(child) in keep:
+            if child.is_dir() or protected(child):
                 continue
-            if child.is_dir():
-                if dedicated:
-                    removed.extend(_remove_tree(child, keep))
-                continue
-            if dedicated or _starts_with_number(child.name, number):
-                try:
-                    child.unlink(missing_ok=True)
-                    removed.append(child)
-                except OSError as exc:
-                    logger.warning("rebuild cleanup skipped", path=str(child), error=str(exc))
+            if not any_file and not _starts_with_number(child.name, number):
+                if not (dedicated and child.name.casefold() in _FIXED_PRODUCT_NAMES):
+                    continue
+            try:
+                child.unlink(missing_ok=True)
+                removed.append(child)
+            except OSError as exc:
+                logger.warning("rebuild cleanup skipped", path=str(child), error=str(exc))
+
+    for directory in directories:
+        purge(directory, any_file=False)
+    for directory in extrafanart_dirs:
+        purge(directory, any_file=True)
     return removed
 
 
@@ -626,6 +618,7 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                 continue
             keep: set[Path] = set()
             directories: list[Path] = []
+            extrafanart_dirs: list[Path] = []
             for member in members:
                 source = await existing_disk_path(Path(member.path), follow_symlinks=False)
                 if source is None:
@@ -650,7 +643,15 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                     keep.add(_resolved(paths.nfo))
                 if member.id not in live_ids or DownloadableResource.trailer not in kinds:
                     keep.add(_resolved(paths.trailer))
-            removed = await _purge_item_dirs(directories, metadata.number, keep)
+                if DownloadableResource.extrafanart in kinds:
+                    extrafanart_dirs.append(paths.extrafanart_dir)
+            removed = await _purge_item_dirs(
+                directories,
+                metadata.number,
+                keep,
+                extrafanart_dirs=extrafanart_dirs,
+                library_root=Path(library.path),
+            )
             if removed:
                 logger.info(
                     "organize rebuild cleaned stale products",

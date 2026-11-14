@@ -1543,6 +1543,52 @@ async def test_organize_rebuild_keeps_files_of_neighbours_in_shared_dir(
 
 
 @pytest.mark.asyncio(loop_scope="function")
+async def test_organize_rebuild_never_descends_into_neighbour_dirs(
+    repo: Repository, resource_store: ResourceStore, tmp_path: Path
+) -> None:
+    """待清理目录里全是子目录时 (演员目录 / 库根都可能是这种形状), 不得判成条目独占再递归清空."""
+    lib_root = tmp_path / "lib"
+    lib_root.mkdir()
+    src = lib_root / "incoming" / "NSFS-039.mp4"
+    src.parent.mkdir()
+    src.write_bytes(b"new-single")
+    studio = lib_root / "Studio"
+    studio.mkdir()
+    neighbour = studio / "OTHER-001" / "OTHER-001.mp4"
+    neighbour.parent.mkdir()
+    neighbour.write_bytes(b"other")
+    neighbour_nfo = neighbour.parent / "OTHER-001.nfo"
+    neighbour_nfo.write_bytes(b"other-nfo")
+    stale = studio / "NSFS-039-CD1.mp4"
+    stale.write_bytes(b"stale")
+
+    lib = await repo.create_library(
+        name="t",
+        path=str(lib_root),
+        video_template="{studio}/{number}.{ext}",
+        write_nfo=False,
+        copy_resources=[],
+    )
+    assert lib.id is not None
+    meta = await repo.upsert_metadata(number="NSFS-039", studio="Studio")
+    assert meta.id is not None
+    await repo.create_media_file(
+        lib.id, path=str(src), number="NSFS-039", status=MediaFileStatus.SCRAPED, metadata_id=meta.id
+    )
+
+    org = OrganizeHandler(repo, HotSettings(), resource_store)
+    result = await org.handle(OrganizePayload(library_id=lib.id, path=str(src.parent), rebuild=True))
+    assert result.success is True
+    assert result.result is not None
+    assert result.result.organized == 1
+
+    assert (studio / "NSFS-039.mp4").exists()
+    assert not stale.exists()
+    assert neighbour.read_bytes() == b"other"
+    assert neighbour_nfo.read_bytes() == b"other-nfo"
+
+
+@pytest.mark.asyncio(loop_scope="function")
 async def test_organize_without_rebuild_keeps_stale_products(
     repo: Repository, resource_store: ResourceStore, tmp_path: Path
 ) -> None:
