@@ -297,6 +297,20 @@ async def _resolve_local(url: str, store: ResourceStore, client: WebClient) -> P
     return await store.acquire(url, client)
 
 
+async def _local_source(url: str, store: ResourceStore) -> Path | None:
+    """只解析本地文件, 不下载也不重新派生: 判定阶段用它对齐落盘阶段的解析口径.
+
+    手动裁切把 ``poster_urls`` 换成内部 URL, 落盘走 ``acquire`` 能命中那张裁切图;
+    判定也必须按 hash 查到同一个文件, 否则会以为产物缺失并反复重建.
+    """
+    token = internal_url_hash(url)
+    if token is not None:
+        found = await store.get_by_url_hash(token)
+        return found[1] if found is not None else None
+    return await store.resolve(url)
+
+
+
 async def _acquire_first_local(urls: list[str], store: ResourceStore, client: WebClient) -> Path | None:
     for url in urls:
         path = await _resolve_local(url, store, client)
@@ -744,14 +758,14 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
             if kind not in kinds:
                 continue
             for url in urls:
-                path = await self._resource_store.resolve(url)
+                path = await _local_source(url, self._resource_store)
                 if path is not None:
                     sources[kind] = path
                     break
         stills: list[Path] = []
         if DownloadableResource.extrafanart in kinds:
             for urls in metadata.extrafanart_urls.values():
-                resolved = [await self._resource_store.resolve(url) for url in urls]
+                resolved = [await _local_source(url, self._resource_store) for url in urls]
                 if resolved and all(path is not None for path in resolved):
                     stills = [path for path in resolved if path is not None]
                     break

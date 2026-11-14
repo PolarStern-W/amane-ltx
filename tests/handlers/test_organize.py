@@ -1822,3 +1822,44 @@ async def test_organize_rebuild_of_one_part_rebuilds_the_whole_item(
     assert (dest_dir / "SIVR-490-CD1.mp4").exists()
     assert (dest_dir / "SIVR-490-CD2.mp4").exists()
     assert not stale.exists()
+@pytest.mark.asyncio(loop_scope="function")
+async def test_organize_rebuild_treats_manual_crop_as_unchanged(
+    repo: Repository, resource_store: ResourceStore, tmp_path: Path
+) -> None:
+    """手动裁切把 poster_urls 换成内部 URL 后, 第二轮整理不该再判为有变化."""
+
+    async def producer(dest: Path) -> bool:
+        dest.write_bytes(b"crop")
+        return True
+
+    crop = await resource_store.acquire_derived("POSTER-SRC", "crop", "0,0,1,1", producer)
+    assert crop is not None
+    internal = f"/api/resources/{resource_store.url_hash(crop.url)}"
+
+    lib_root = tmp_path / "lib"
+    lib_root.mkdir()
+    incoming = lib_root / "incoming"
+    incoming.mkdir()
+    video = incoming / "NSFS-039.mp4"
+    video.write_bytes(b"v")
+
+    lib = await repo.create_library(
+        name="t", path=str(lib_root), write_nfo=False, copy_resources=["poster"]
+    )
+    assert lib.id is not None
+    meta = await repo.upsert_metadata(number="NSFS-039", studio="Studio", poster_urls=[internal])
+    assert meta.id is not None
+    await repo.create_media_file(
+        lib.id, path=str(video), number="NSFS-039", status=MediaFileStatus.SCRAPED, metadata_id=meta.id
+    )
+
+    org = OrganizeHandler(repo, HotSettings(), resource_store)
+    first = await org.handle(OrganizePayload(library_id=lib.id, path=str(incoming), rebuild=True))
+    assert first.success is True
+    assert first.result is not None
+    assert first.result.organized == 1
+
+    second = await org.handle(OrganizePayload(library_id=lib.id, path=str(incoming), rebuild=True))
+    assert second.success is True
+    assert second.result is not None
+    assert (second.result.organized, second.result.skipped) == (0, 1)
