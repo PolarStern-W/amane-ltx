@@ -3480,6 +3480,12 @@ export type OrganizeSubmission = {
      */
     prune_empty_dirs?: boolean;
     /**
+     * Rebuild
+     *
+     * 重建: 落盘前清掉条目目录里上一轮留下的旧产物 (换版后多出来的 CD / 集数文件、旧剧照、孤儿字幕等), 再按本轮重新写入; 只清该条目的视频目录与链接目录, 不动其它条目
+     */
+    rebuild?: boolean;
+    /**
      * Type
      */
     type: 'organize';

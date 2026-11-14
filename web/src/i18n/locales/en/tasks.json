@@ -247,6 +247,10 @@
       "prune_empty_dirs": {
         "label": "Prune emptied directories",
         "description": "Removes directories emptied by this run; no effect on copy / hardlink / symbolic link"
+      },
+      "rebuild": {
+        "label": "Rebuild",
+        "description": "Wipe stale products left by the previous run in this item's folder (extra files after a re-version, old artwork, orphan subtitles) before writing this run; only this item's video and link directories are touched"
       }
     },
     "scrape": {

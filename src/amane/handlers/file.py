@@ -1,3 +1,4 @@
+import re
 import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -324,6 +325,103 @@ def _write_into_library(source: Path, target: Path) -> None:
             logger.debug("temp file cleanup skipped", path=str(tmp), error=str(exc))
 
 
+_FIXED_PRODUCT_NAMES = frozenset({"poster.jpg", "thumb.jpg", "fanart.jpg", "trailer.mp4", "movie.nfo", "tvshow.nfo"})
+
+
+def _resolved(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()
+
+
+def _starts_with_number(name: str, number: str) -> bool:
+    """名字是否以该番号开头且后一位不是数字; 番号是 LTX-123 这类前缀时不会误命中间缀."""
+    return re.match(rf"{re.escape(number)}(?![0-9])", name, re.IGNORECASE) is not None
+
+
+def _belongs_to_item(name: str, number: str) -> bool:
+    """名字是否可能由本条目生成: 番号前缀, 或固定产物名 / 隐藏文件."""
+    if name.startswith("."):
+        return True
+    if name.casefold() in _FIXED_PRODUCT_NAMES:
+        return True
+    return _starts_with_number(name, number)
+
+
+def _is_dedicated_dir(directory: Path, number: str) -> bool:
+    """目录是否只放本条目: 默认模板是 ``{studio}/{number}/``, 目录名就是番号.
+
+    用户把条目摊平到工作室目录时, 目录里会有别的番号, 这时只删本条目番号前缀的文件,
+    不整目录清空, 避免误删同目录其它条目.
+    """
+    folded = number.casefold()
+    name = directory.name.casefold()
+    if name == folded or name.startswith(f"{folded} "):
+        return True
+    try:
+        children = list(directory.iterdir())
+    except OSError:
+        return False
+    return all(child.is_dir() or _belongs_to_item(child.name, number) for child in children)
+
+
+def _remove_tree(directory: Path, keep: set[Path]) -> list[Path]:
+    removed: list[Path] = []
+    try:
+        children = list(directory.iterdir())
+    except OSError as exc:
+        logger.warning("rebuild cleanup skipped", path=str(directory), error=str(exc))
+        return removed
+    for child in children:
+        if _resolved(child) in keep:
+            continue
+        if child.is_dir():
+            removed.extend(_remove_tree(child, keep))
+            continue
+        try:
+            child.unlink(missing_ok=True)
+            removed.append(child)
+        except OSError as exc:
+            logger.warning("rebuild cleanup skipped", path=str(child), error=str(exc))
+    return removed
+
+
+@in_thread
+def _purge_item_dirs(directories: Sequence[Path], number: str, keep: set[Path]) -> list[Path]:
+    """清掉这些目录里不属于本轮的旧产物; 返回被删的路径.
+
+    ``keep`` 由调用方按条目收集: 仍在磁盘上的成员源文件, 以及本轮不会重写的 NFO / 预告片.
+    """
+    removed: list[Path] = []
+    seen: set[Path] = set()
+    for directory in directories:
+        key = _resolved(directory)
+        if key in seen or not directory.is_dir():
+            continue
+        seen.add(key)
+        dedicated = _is_dedicated_dir(directory, number)
+        try:
+            children = list(directory.iterdir())
+        except OSError as exc:
+            logger.warning("rebuild cleanup skipped", path=str(directory), error=str(exc))
+            continue
+        for child in children:
+            if _resolved(child) in keep:
+                continue
+            if child.is_dir():
+                if dedicated:
+                    removed.extend(_remove_tree(child, keep))
+                continue
+            if dedicated or _starts_with_number(child.name, number):
+                try:
+                    child.unlink(missing_ok=True)
+                    removed.append(child)
+                except OSError as exc:
+                    logger.warning("rebuild cleanup skipped", path=str(child), error=str(exc))
+    return removed
+
+
 @in_thread
 def _place_library_images(
     paths: ResolvedPaths,
@@ -498,6 +596,68 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
             return [mf for mf in indexed if path_is_under(mf.path, payload.path)]
         return indexed
 
+    async def _rebuild_items(
+        self,
+        live: list[MediaFile],
+        library: Library,
+        payload: OrganizePayload,
+    ) -> None:
+        """重建前按条目清掉上一轮产物.
+
+        ``keep`` 收集同条目所有仍在磁盘上的成员源文件, 以及本轮不会重写的 NFO / 预告片;
+        源文件已不存在的旧成员不保留, 它留下的产物随目录一起被清掉.
+        """
+        metadata_ids = sorted({mf.metadata_id for mf in live if mf.metadata_id is not None})
+        if not metadata_ids:
+            return
+        members_by_metadata: dict[int, list[MediaFile]] = {}
+        for member in await self._repo.list_media_files(metadata_ids=metadata_ids, limit=None):
+            if member.metadata_id is not None:
+                members_by_metadata.setdefault(member.metadata_id, []).append(member)
+        live_ids = {mf.id for mf in live if mf.id is not None}
+        write_nfo = library.write_nfo if payload.write_nfo is None else payload.write_nfo
+        copy_resources = library.copy_resources if payload.copy_resources is None else payload.copy_resources
+        kinds = set(copy_resources) if copy_resources is not None else set(DownloadableResource)
+        for metadata_id, members in members_by_metadata.items():
+            if not any(member.id in live_ids for member in members):
+                continue
+            metadata = await self._repo.get_metadata(metadata_id)
+            if metadata is None:
+                continue
+            keep: set[Path] = set()
+            directories: list[Path] = []
+            for member in members:
+                source = await existing_disk_path(Path(member.path), follow_symlinks=False)
+                if source is None:
+                    continue
+                keep.add(_resolved(source))
+                ext = Path(member.path).suffix.lstrip(".")
+                file_info = parse_file_info(member.path, has_external_subtitle=member.has_external_subtitle)
+                paths = resolve_paths(
+                    library,
+                    metadata,
+                    ext=ext,
+                    file_info=file_info,
+                    source_path=Path(member.path),
+                    safe_dirs=self._safe_dirs,
+                )
+                directories.append(paths.video.parent)
+                if paths.link is not None:
+                    directories.append(paths.link.parent)
+                    if member.id not in live_ids:
+                        keep.add(_resolved(paths.link))
+                if member.id not in live_ids or not write_nfo:
+                    keep.add(_resolved(paths.nfo))
+                if member.id not in live_ids or DownloadableResource.trailer not in kinds:
+                    keep.add(_resolved(paths.trailer))
+            removed = await _purge_item_dirs(directories, metadata.number, keep)
+            if removed:
+                logger.info(
+                    "organize rebuild cleaned stale products",
+                    number=metadata.number,
+                    removed=[str(path) for path in removed],
+                )
+
     async def handle(self, payload: OrganizePayload) -> TaskResult[OrganizeResult]:
         library = await self._repo.get_library(payload.library_id)
         if library is None:
@@ -560,6 +720,8 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
         # 只有移动方式会移走源文件, 复制 / 硬链接 / 符号链接不腾空目录.
         prune_candidates: set[Path] = set()
         collect_prune = payload.prune_empty_dirs and library.move_mode is MoveMode.MOVE
+        if payload.rebuild and live:
+            await self._rebuild_items(live, library, payload)
         if total == 0:
             await self.report_progress(1, 1, "done")
         else:

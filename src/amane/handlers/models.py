@@ -158,6 +158,13 @@ class OrganizePayload(LibraryBase):
         default=True,
         description="移动后删除本次腾空的目录 (库根与 .amane_trash 除外); 复制 / 硬链接 / 符号链接方式不移走源文件, 该开关无效",
     )
+    rebuild: bool = Field(
+        default=False,
+        description=(
+            "重建: 落盘前清掉条目目录里上一轮留下的旧产物 (换版后多出来的 CD / 集数文件、旧剧照、"
+            "孤儿字幕等), 再按本轮重新写入; 只清该条目的视频目录与链接目录, 不动其它条目"
+        ),
+    )
 
     async def resolve(self, repo: Repository) -> None:
         if self.media_file_ids is not None and self.path:

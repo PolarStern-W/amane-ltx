@@ -266,7 +266,7 @@ class ScrapeHandler(TaskHandler[ScrapePayload, ScrapeResult]):
                 return []
             if not library.auto_organize:
                 return []
-            organize = OrganizePayload(library_id=file.library_id, media_file_ids=[file.id])
+            organize = OrganizePayload(library_id=file.library_id, media_file_ids=[file.id], rebuild=True)
             return [
                 FollowupTask(
                     key=f"organize:{file.id}",

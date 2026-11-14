@@ -1445,6 +1445,142 @@ async def test_organize_keeps_source_dir_when_prune_disabled(
 
 
 @pytest.mark.asyncio(loop_scope="function")
+async def test_organize_rebuild_clears_stale_products(
+    repo: Repository, resource_store: ResourceStore, tmp_path: Path
+) -> None:
+    """重建: 换版后清掉条目目录里上一轮留下的旧分集 / 字幕 / 剧照, 其它条目不动."""
+    lib_root = tmp_path / "lib"
+    local = tmp_path / "emby"
+    lib_root.mkdir()
+    local.mkdir()
+    src = lib_root / "incoming" / "NSFS-039.mp4"
+    src.parent.mkdir()
+    src.write_bytes(b"new-single")
+
+    dest_dir = lib_root / "Studio" / "NSFS-039"
+    dest_dir.mkdir(parents=True)
+    link_dir = local / "NSFS-039"
+    link_dir.mkdir(parents=True)
+    stale = [
+        dest_dir / "NSFS-039-CD1.mp4",
+        dest_dir / "NSFS-039-CD2.mp4",
+        dest_dir / "NSFS-039-CD1.chs.srt",
+        link_dir / "NSFS-039-CD1.strm",
+        link_dir / "NSFS-039-CD1.nfo",
+        link_dir / "poster.jpg",
+    ]
+    for path in stale:
+        path.write_bytes(b"stale")
+    other = lib_root / "Studio" / "OTHER-001" / "OTHER-001.mp4"
+    other.parent.mkdir()
+    other.write_bytes(b"other")
+
+    lib = await repo.create_library(
+        name="t",
+        path=str(lib_root),
+        link_template=str(local / "{number}" / "{number}.{ext}"),
+        link_mode=LinkMode.STRM,
+        write_nfo=True,
+        copy_resources=[],
+    )
+    assert lib.id is not None
+    meta = await repo.upsert_metadata(number="NSFS-039", studio="Studio")
+    assert meta.id is not None
+    await repo.create_media_file(
+        lib.id, path=str(src), number="NSFS-039", status=MediaFileStatus.SCRAPED, metadata_id=meta.id
+    )
+
+    org = OrganizeHandler(repo, HotSettings(), resource_store, safe_dirs=[tmp_path])
+    result = await org.handle(OrganizePayload(library_id=lib.id, path=str(src.parent), rebuild=True))
+    assert result.success is True
+    assert result.result is not None
+    assert (result.result.organized, result.result.conflicted, result.result.failed) == (1, 0, 0)
+
+    assert sorted(path.name for path in dest_dir.iterdir()) == ["NSFS-039.mp4"]
+    assert sorted(path.name for path in link_dir.iterdir()) == ["NSFS-039.nfo", "NSFS-039.strm"]
+    assert all(not path.exists() for path in stale)
+    assert other.read_bytes() == b"other"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_organize_rebuild_keeps_files_of_neighbours_in_shared_dir(
+    repo: Repository, resource_store: ResourceStore, tmp_path: Path
+) -> None:
+    """摊平到共享目录时只删番号前缀文件, 同目录其它内容保留."""
+    lib_root = tmp_path / "lib"
+    lib_root.mkdir()
+    src = lib_root / "incoming" / "NSFS-039.mp4"
+    src.parent.mkdir()
+    src.write_bytes(b"new-single")
+    stale = lib_root / "NSFS-039-CD1.mp4"
+    stale.write_bytes(b"stale")
+    neighbour = lib_root / "OTHER-001.mp4"
+    neighbour.write_bytes(b"other")
+
+    lib = await repo.create_library(
+        name="t",
+        path=str(lib_root),
+        video_template="{number}.{ext}",
+        write_nfo=False,
+        copy_resources=[],
+    )
+    assert lib.id is not None
+    meta = await repo.upsert_metadata(number="NSFS-039", studio="Studio")
+    assert meta.id is not None
+    await repo.create_media_file(
+        lib.id, path=str(src), number="NSFS-039", status=MediaFileStatus.SCRAPED, metadata_id=meta.id
+    )
+
+    org = OrganizeHandler(repo, HotSettings(), resource_store)
+    result = await org.handle(OrganizePayload(library_id=lib.id, path=str(src.parent), rebuild=True))
+    assert result.success is True
+    assert result.result is not None
+    assert result.result.organized == 1
+
+    assert (lib_root / "NSFS-039.mp4").exists()
+    assert not stale.exists()
+    assert neighbour.read_bytes() == b"other"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_organize_without_rebuild_keeps_stale_products(
+    repo: Repository, resource_store: ResourceStore, tmp_path: Path
+) -> None:
+    """未勾选重建时保留上一轮产物, 只落盘本轮文件."""
+    lib_root = tmp_path / "lib"
+    lib_root.mkdir()
+    src = lib_root / "incoming" / "NSFS-039.mp4"
+    src.parent.mkdir()
+    src.write_bytes(b"new-single")
+    dest_dir = lib_root / "Studio" / "NSFS-039"
+    dest_dir.mkdir(parents=True)
+    stale = dest_dir / "NSFS-039-CD1.mp4"
+    stale.write_bytes(b"stale")
+
+    lib = await repo.create_library(
+        name="t",
+        path=str(lib_root),
+        write_nfo=False,
+        copy_resources=[],
+    )
+    assert lib.id is not None
+    meta = await repo.upsert_metadata(number="NSFS-039", studio="Studio")
+    assert meta.id is not None
+    await repo.create_media_file(
+        lib.id, path=str(src), number="NSFS-039", status=MediaFileStatus.SCRAPED, metadata_id=meta.id
+    )
+
+    org = OrganizeHandler(repo, HotSettings(), resource_store)
+    result = await org.handle(OrganizePayload(library_id=lib.id, path=str(src.parent)))
+    assert result.success is True
+    assert result.result is not None
+    assert result.result.organized == 1
+
+    assert (dest_dir / "NSFS-039.mp4").exists()
+    assert stale.read_bytes() == b"stale"
+
+
+@pytest.mark.asyncio(loop_scope="function")
 @pytest.mark.parametrize("mode", [MoveMode.COPY, MoveMode.HARDLINK, MoveMode.SYMLINK])
 async def test_organize_other_modes_leave_source_dir(
     repo: Repository, resource_store: ResourceStore, tmp_path: Path, mode: MoveMode
