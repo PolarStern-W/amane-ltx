@@ -250,7 +250,7 @@
       },
       "rebuild": {
         "label": "Rebuild",
-        "description": "Wipe stale products left by the previous run for this item (extra files after a re-version, old artwork, orphan subtitles) before writing this run. Only direct child files of the video and link directories are removed: anything starting with the number, plus fixed product names and the extrafanart folder inside the item's own folder. Never recurses into subdirectories, never touches the library root or the trash, and keeps sources still on disk. Items whose file set and products are unchanged are skipped entirely"
+        "description": "When an item changed, wipe its folder and redo it — old files, artwork, NFO and links, plus side files written by other tools such as mediainfo — then write every source file of the item again, all parts restored together. Only a folder named after the number is wiped whole; in a shared folder only files starting with the number are removed. Items whose file set and products are unchanged are skipped, and side files like mediainfo never count as a change"
       }
     },
     "scrape": {

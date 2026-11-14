@@ -1731,3 +1731,94 @@ async def test_organize_rebuild_reruns_when_metadata_is_newer(
     assert second.result is not None
     assert (second.result.organized, second.result.skipped) == (1, 0)
     assert dest.exists()
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_organize_rebuild_ignores_side_files_but_removes_them_on_rebuild(
+    repo: Repository, resource_store: ResourceStore, tmp_path: Path
+) -> None:
+    """mediainfo 这类外部文件不触发重建; 条目因别的原因重建时连同整个目录一起清掉."""
+    lib_root = tmp_path / "lib"
+    lib_root.mkdir()
+    src = lib_root / "incoming" / "NSFS-039.mp4"
+    src.parent.mkdir()
+    src.write_bytes(b"video")
+
+    lib = await repo.create_library(name="t", path=str(lib_root), write_nfo=True, copy_resources=[])
+    assert lib.id is not None
+    meta = await repo.upsert_metadata(number="NSFS-039", studio="Studio")
+    assert meta.id is not None
+    await repo.create_media_file(
+        lib.id, path=str(src), number="NSFS-039", status=MediaFileStatus.SCRAPED, metadata_id=meta.id
+    )
+
+    org = OrganizeHandler(repo, HotSettings(), resource_store)
+    first = await org.handle(OrganizePayload(library_id=lib.id, path=str(lib_root), rebuild=True))
+    assert first.success is True
+    assert first.result is not None
+    assert first.result.organized == 1
+    dest_dir = lib_root / "Studio" / "NSFS-039"
+    dest = dest_dir / "NSFS-039.mp4"
+    side = dest_dir / "NSFS-039-mediainfo.json"
+    side.write_text("{}", encoding="utf-8")
+
+    second = await org.handle(OrganizePayload(library_id=lib.id, path=str(lib_root), rebuild=True))
+    assert second.success is True
+    assert second.result is not None
+    assert (second.result.organized, second.result.skipped) == (0, 1)
+    assert side.exists()
+
+    await repo.upsert_metadata(number="NSFS-039", studio="Studio", title="new title")
+    third = await org.handle(OrganizePayload(library_id=lib.id, path=str(lib_root), rebuild=True))
+    assert third.success is True
+    assert third.result is not None
+    assert third.result.organized == 1
+    assert dest.exists()
+    assert (dest_dir / "NSFS-039.nfo").exists()
+    assert not side.exists()
+@pytest.mark.asyncio(loop_scope="function")
+async def test_organize_rebuild_of_one_part_rebuilds_the_whole_item(
+    repo: Repository, resource_store: ResourceStore, tmp_path: Path
+) -> None:
+    """只整理 CD1 时条目有变化, 目录整清后 CD1 与 CD2 一起补回, 旧产物不会留下."""
+    lib_root = tmp_path / "lib"
+    lib_root.mkdir()
+    incoming = lib_root / "incoming"
+    incoming.mkdir()
+    cd1 = incoming / "SIVR-490-CD1.mp4"
+    cd2 = incoming / "SIVR-490-CD2.mp4"
+    cd1.write_bytes(b"cd1")
+    cd2.write_bytes(b"cd2")
+
+    lib = await repo.create_library(name="t", path=str(lib_root), write_nfo=False, copy_resources=[])
+    assert lib.id is not None
+    meta = await repo.upsert_metadata(number="SIVR-490", studio="Studio")
+    assert meta.id is not None
+    first = await repo.create_media_file(
+        lib.id, path=str(cd1), number="SIVR-490", status=MediaFileStatus.SCRAPED, metadata_id=meta.id
+    )
+    await repo.create_media_file(
+        lib.id, path=str(cd2), number="SIVR-490", status=MediaFileStatus.SCRAPED, metadata_id=meta.id
+    )
+
+    org = OrganizeHandler(repo, HotSettings(), resource_store)
+    initial = await org.handle(OrganizePayload(library_id=lib.id, path=str(incoming), rebuild=True))
+    assert initial.success is True
+    assert initial.result is not None
+    assert initial.result.organized == 2
+    dest_dir = lib_root / "Studio" / "SIVR-490"
+    assert (dest_dir / "SIVR-490-CD1.mp4").exists()
+    assert (dest_dir / "SIVR-490-CD2.mp4").exists()
+    stale = dest_dir / "SIVR-490-CD3.mp4"
+    stale.write_bytes(b"stale")
+
+    await repo.upsert_metadata(number="SIVR-490", studio="Studio", title="new title")
+    assert first.id is not None
+    scoped = await org.handle(
+        OrganizePayload(library_id=lib.id, media_file_ids=[first.id], rebuild=True)
+    )
+    assert scoped.success is True
+    assert scoped.result is not None
+    assert scoped.result.organized == 2
+    assert (dest_dir / "SIVR-490-CD1.mp4").exists()
+    assert (dest_dir / "SIVR-490-CD2.mp4").exists()
+    assert not stale.exists()

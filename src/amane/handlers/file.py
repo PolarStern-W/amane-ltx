@@ -358,6 +358,13 @@ def _same_path(left: Path, right: Path) -> bool:
     return path_is_under(left, right) and path_is_under(right, left)
 
 
+def _affects_rebuild(path: Path, extrafanart_dirs: Sequence[Path]) -> bool:
+    """这个将被清掉的路径是否说明条目变了; 别的软件写的附属文件 (mediainfo 等) 不算."""
+    if any(path_is_under(path, directory) for directory in extrafanart_dirs):
+        return True
+    return path.suffix.casefold() in _MANAGED_SUFFIXES or path.name.casefold() in _FIXED_PRODUCT_NAMES
+
+
 def _epoch(moment: datetime) -> float:
     """datetime 归一成 epoch 秒; ``Metadata.updated_at`` 可能带时区, 比较只用数字就不必猜口径."""
     return moment.replace(tzinfo=UTC).timestamp() if moment.tzinfo is None else moment.timestamp()
@@ -407,10 +414,12 @@ async def _item_needs_rebuild(
     sources: dict[DownloadableResource, Path],
     stills: Sequence[Path],
     extrafanart_dir: Path | None,
+    extrafanart_dirs: Sequence[Path] = (),
 ) -> bool:
     """条目是否需要重建: 有残留、缺产物、或产物比 metadata / 源资源旧.
 
-    残留判定直接复用 dry-run 的清理候选; 因此「目录里多了上一轮的文件」一定算变化.
+    残留判定直接复用 dry-run 的清理候选; 因此「目录里多了上一轮的文件」一定算变化, 而 mediainfo
+    这类外部工具写的附属文件不参与判定 — 它们只在该条目因别的原因重建时被顺带删除.
     ``expected`` 含视频落点, 只用于判「缺文件」; 新旧比较只看 ``products`` (NFO / 链接 /
     图片 / 剧照) — 视频不会因整理被重写, 其 mtime 是下载时间, 混进来会让每个条目都判成过期.
     """
@@ -420,10 +429,11 @@ async def _item_needs_rebuild(
         directories,
         metadata.number,
         keep | expected,
+        extrafanart_dirs=extrafanart_dirs,
         library_root=Path(library.path),
         dry_run=True,
     )
-    if any(path.suffix.casefold() in _MANAGED_SUFFIXES for path in stale):
+    if any(_affects_rebuild(path, extrafanart_dirs) for path in stale):
         return True
     for path in expected:
         try:
@@ -467,15 +477,16 @@ def _purge_item_dirs(
     library_root: Path | None = None,
     dry_run: bool = False,
 ) -> list[Path]:
-    """清掉这些目录里能确定属于本条目的旧产物; 返回被删 (或将被删) 的路径.
+    """清空这些目录里属于本条目的东西; 返回被删 (或将被删) 的路径.
 
-    只删两类普通文件: 名字以番号开头的 (换版后多出来的 CD / 集数文件、旧 NFO 与链接),
-    以及条目独占目录里的固定产物名; 剧照目录里的文件可整体清理. 不递归子目录、不删目录,
-    库根与回收目录一律跳过, ``keep`` 里的路径始终保留 — 共享祖先目录因此不会被清空.
-    ``dry_run`` 只列候选, 不落删, 供「条目有没有变化」的判定复用.
+    条目独占目录 (目录名就是番号) 整目录清空: 旧 CD / 集数文件、剧照、NFO、链接, 连同别的工具
+    写进来的 mediainfo 等附属文件一并删除, 由重建后的写入补齐. 摊平到共享目录时只删名字以番号
+    开头的文件, 别的条目一个字节都不碰. ``keep`` (仍在盘上的成员源文件) 始终保留,
+    库根与回收目录一律跳过. ``dry_run`` 只列候选, 不落删, 供「条目有没有变化」的判定复用.
     """
     removed: list[Path] = []
     seen: set[Path] = set()
+    dropped: set[Path] = set()
     trash_root = library_root / TRASH_DIRNAME if library_root is not None else None
 
     def protected(path: Path) -> bool:
@@ -488,35 +499,56 @@ def _purge_item_dirs(
                 return True
         return False
 
-    def purge(directory: Path, *, any_file: bool) -> None:
+    def drop(path: Path) -> None:
+        key = _resolved(path)
+        if key in dropped:
+            return
+        dropped.add(key)
+        if path.is_dir() and not path.is_symlink():
+            try:
+                children = list(path.iterdir())
+            except OSError as exc:
+                logger.warning("rebuild cleanup skipped", path=str(path), error=str(exc))
+                return
+            for child in children:
+                if not protected(child):
+                    drop(child)
+            if not dry_run:
+                try:
+                    if not any(path.iterdir()):
+                        path.rmdir()
+                except OSError as exc:
+                    logger.debug("rebuild cleanup kept directory", path=str(path), error=str(exc))
+            return
+        removed.append(path)
+        if dry_run:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("rebuild cleanup skipped", path=str(path), error=str(exc))
+
+    def purge(directory: Path, *, whole_dir: bool) -> None:
         key = _resolved(directory)
         if key in seen or not directory.is_dir() or protected(directory):
             return
         seen.add(key)
-        dedicated = any_file or _is_dedicated_dir(directory, number)
         try:
             children = list(directory.iterdir())
         except OSError as exc:
             logger.warning("rebuild cleanup skipped", path=str(directory), error=str(exc))
             return
         for child in children:
-            if child.is_dir() or protected(child):
+            if protected(child):
                 continue
-            if not any_file and not _starts_with_number(child.name, number):
-                if not (dedicated and child.name.casefold() in _FIXED_PRODUCT_NAMES):
-                    continue
-            removed.append(child)
-            if dry_run:
+            if not whole_dir and (child.is_dir() or not _starts_with_number(child.name, number)):
                 continue
-            try:
-                child.unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning("rebuild cleanup skipped", path=str(child), error=str(exc))
+            drop(child)
 
     for directory in directories:
-        purge(directory, any_file=False)
+        purge(directory, whole_dir=_is_dedicated_dir(directory, number))
     for directory in extrafanart_dirs:
-        purge(directory, any_file=True)
+        purge(directory, whole_dir=True)
     return removed
 
 
@@ -731,11 +763,12 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
         library: Library,
         payload: OrganizePayload,
     ) -> tuple[list[MediaFile], dict[int, _RebuildPlan]]:
-        """筛出需要重建的条目, 并为每个条目准备清理计划; 没有变化的条目整条跳过.
+        """筛出需要重建的条目, 为每个条目准备清理计划, 并把条目全部分集纳入本次整理.
 
-        ``keep`` 收集同条目所有仍在磁盘上的成员源文件, 以及本轮不会重写的 NFO / 预告片;
-        ``expected`` 是本轮应该写出的全部文件; ``products`` 是其中会被重写的那部分.
-        清理计划留到该条目真正落盘前才执行 — 整库范围先删后写会让中途取消留下空目录.
+        整理是按番号执行的: 一个条目有 CD1 / CD2 两个源文件时, 任一变化都要把该条目的目录清空,
+        再把两个分集一起补回去, 所以 ``rebuilt_members`` 收集的是条目下所有仍在盘上的成员.
+        ``keep`` 只保留这些成员自己的源文件; ``expected`` 是本轮应该写出的全部文件,
+        ``products`` 是其中会被重写的那部分. 清理计划留到该条目真正落盘前才执行.
         """
         metadata_ids = sorted({mf.metadata_id for mf in live if mf.metadata_id is not None})
         plans: dict[int, _RebuildPlan] = {}
@@ -745,13 +778,14 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
         for member in await self._repo.list_media_files(metadata_ids=metadata_ids, limit=None):
             if member.metadata_id is not None:
                 members_by_metadata.setdefault(member.metadata_id, []).append(member)
-        live_ids = {mf.id for mf in live if mf.id is not None}
+        scoped = {mf.metadata_id for mf in live}
         write_nfo = library.write_nfo if payload.write_nfo is None else payload.write_nfo
         copy_resources = library.copy_resources if payload.copy_resources is None else payload.copy_resources
         kinds = set(copy_resources) if copy_resources is not None else set(DownloadableResource)
         unchanged: set[int] = set()
+        rebuilt_members: dict[int, list[MediaFile]] = {}
         for metadata_id, members in members_by_metadata.items():
-            if not any(member.id in live_ids for member in members):
+            if metadata_id not in scoped:
                 continue
             metadata = await self._repo.get_metadata(metadata_id)
             if metadata is None:
@@ -762,10 +796,12 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
             directories: list[Path] = []
             extrafanart_dirs: list[Path] = []
             live_paths: ResolvedPaths | None = None
+            present: list[MediaFile] = []
             for member in members:
                 source = await existing_disk_path(Path(member.path), follow_symlinks=False)
                 if source is None:
                     continue
+                present.append(member)
                 keep.add(_resolved(source))
                 ext = Path(member.path).suffix.lstrip(".")
                 file_info = parse_file_info(member.path, has_external_subtitle=member.has_external_subtitle)
@@ -778,30 +814,17 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                     safe_dirs=self._safe_dirs,
                 )
                 directories.append(paths.video.parent)
-                if member.id in live_ids:
-                    expected.add(
-                        _resolved(video_dest(paths.video.parent, paths.video.stem, source, suffix=paths.video.suffix))
-                    )
-                    if paths.link is not None:
-                        products.add(_resolved(paths.link))
-                    if write_nfo:
-                        products.add(_resolved(paths.nfo))
-                    live_paths = live_paths or paths
-                else:
-                    # 范围外的成员本轮不会重写, 它的落点必须留下来, 不能被清理一并带走.
-                    keep.add(
-                        _resolved(video_dest(paths.video.parent, paths.video.stem, source, suffix=paths.video.suffix))
-                    )
+                expected.add(
+                    _resolved(video_dest(paths.video.parent, paths.video.stem, source, suffix=paths.video.suffix))
+                )
                 if paths.link is not None:
+                    products.add(_resolved(paths.link))
                     directories.append(paths.link.parent)
-                    if member.id not in live_ids:
-                        keep.add(_resolved(paths.link))
-                if member.id not in live_ids or not write_nfo:
-                    keep.add(_resolved(paths.nfo))
-                if member.id not in live_ids or DownloadableResource.trailer not in kinds:
-                    keep.add(_resolved(paths.trailer))
+                if write_nfo:
+                    products.add(_resolved(paths.nfo))
                 if DownloadableResource.extrafanart in kinds:
                     extrafanart_dirs.append(paths.extrafanart_dir)
+                live_paths = live_paths or paths
             sources, stills = await self._product_sources(metadata, kinds)
             if live_paths is not None:
                 products.update(
@@ -832,6 +855,7 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                 sources=sources,
                 stills=stills,
                 extrafanart_dir=live_paths.extrafanart_dir if live_paths is not None else None,
+                extrafanart_dirs=tuple(extrafanart_dirs),
             ):
                 unchanged.add(metadata_id)
                 continue
@@ -842,9 +866,17 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                 keep=frozenset(keep),
                 expected=frozenset(expected),
             )
+            rebuilt_members[metadata_id] = present
         if unchanged:
             logger.info("organize rebuild skipped unchanged items", count=len(unchanged))
-        return [mf for mf in live if mf.metadata_id not in unchanged], plans
+        ordered = [mf for mf in live if mf.metadata_id not in unchanged]
+        seen = {mf.id for mf in ordered}
+        for members in rebuilt_members.values():
+            for member in members:
+                if member.id is not None and member.id not in seen:
+                    seen.add(member.id)
+                    ordered.append(member)
+        return ordered, plans
 
     async def handle(self, payload: OrganizePayload) -> TaskResult[OrganizeResult]:
         library = await self._repo.get_library(payload.library_id)
@@ -909,10 +941,10 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
         collect_prune = payload.prune_empty_dirs and library.move_mode is MoveMode.MOVE
         plans: dict[int, _RebuildPlan] = {}
         if payload.rebuild and live:
-            before = len(live)
+            before = {mf.id for mf in live}
             live, plans = await self._rebuild_items(live, library, payload)
             # 内容没变的条目整条跳过, 不重写任何产物; 计数并入 skipped 让用户看到「没动」.
-            skipped += before - len(live)
+            skipped += len(before - {mf.id for mf in live})
         total = len(live)
         if total == 0:
             await self.report_progress(1, 1, "done")
