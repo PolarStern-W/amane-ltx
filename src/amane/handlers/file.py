@@ -787,6 +787,11 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                     if write_nfo:
                         products.add(_resolved(paths.nfo))
                     live_paths = live_paths or paths
+                else:
+                    # 范围外的成员本轮不会重写, 它的落点必须留下来, 不能被清理一并带走.
+                    keep.add(
+                        _resolved(video_dest(paths.video.parent, paths.video.stem, source, suffix=paths.video.suffix))
+                    )
                 if paths.link is not None:
                     directories.append(paths.link.parent)
                     if member.id not in live_ids:
@@ -928,8 +933,28 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                     await self.report_progress(i, total, file_path.name)
                     continue
 
-                # 旧产物在落盘成功后才清: 冲突或失败时保留原样, 不会留下空目录.
-                plan = plans.get(metadata_id)
+                # 重建: 落盘之前先把该条目上一轮的产物 (含本轮同名的) 清掉, 目标位才会变 FREE.
+                plan = plans.pop(metadata_id, None)
+                if plan is not None:
+                    source = await existing_disk_path(Path(media_file.path), follow_symlinks=False)
+                    if source is None:
+                        skipped += 1
+                        await self.report_progress(i, total, file_path.name)
+                        continue
+                    removed = await _purge_item_dirs(
+                        plan.directories,
+                        plan.number,
+                        set(plan.keep),
+                        extrafanart_dirs=plan.extrafanart_dirs,
+                        library_root=library_root,
+                    )
+                    if removed:
+                        logger.info(
+                            "organize rebuild cleaned stale products",
+                            number=plan.number,
+                            expected=len(plan.expected),
+                            removed=[str(item) for item in removed],
+                        )
 
                 write_nfo = library.write_nfo if payload.write_nfo is None else payload.write_nfo
                 copy_resources = library.copy_resources if payload.copy_resources is None else payload.copy_resources
@@ -955,22 +980,6 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                 match fop_result.outcome:
                     case PlaceOutcome.PLACED:
                         organized += 1
-                        if plan is not None:
-                            plans.pop(metadata_id, None)
-                            removed = await _purge_item_dirs(
-                                plan.directories,
-                                plan.number,
-                                set(plan.keep | plan.expected),
-                                extrafanart_dirs=plan.extrafanart_dirs,
-                                library_root=library_root,
-                            )
-                            if removed:
-                                logger.info(
-                                    "organize rebuild cleaned stale products",
-                                    number=plan.number,
-                                    expected=len(plan.expected),
-                                    removed=[str(item) for item in removed],
-                                )
                         if collect_prune:
                             prune_candidates.update(ancestor_dirs(file_path, library_root=library_root))
                         # 字幕冲突的 path 是留在原处的那条字幕, 不是视频源路径.
