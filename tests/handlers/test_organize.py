@@ -1,6 +1,8 @@
 """ORGANIZE: 只处理范围内的索引, 落盘前删除本次读到的失效行."""
 
 import asyncio
+import os
+import time
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
@@ -1656,3 +1658,76 @@ async def test_organize_other_modes_leave_source_dir(
     assert result.result.pruned_dirs == 0
     assert src.exists()
     assert src_dir.is_dir()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_organize_rebuild_skips_unchanged_item_on_rerun(
+    repo: Repository, resource_store: ResourceStore, tmp_path: Path
+) -> None:
+    """条目没变时, 第二次全库重建不删不写, 只计一次跳过."""
+    lib_root = tmp_path / "lib"
+    lib_root.mkdir()
+    src = lib_root / "incoming" / "NSFS-039.mp4"
+    src.parent.mkdir()
+    src.write_bytes(b"video")
+
+    lib = await repo.create_library(name="t", path=str(lib_root), write_nfo=False, copy_resources=[])
+    assert lib.id is not None
+    meta = await repo.upsert_metadata(number="NSFS-039", studio="Studio")
+    assert meta.id is not None
+    await repo.create_media_file(
+        lib.id, path=str(src), number="NSFS-039", status=MediaFileStatus.SCRAPED, metadata_id=meta.id
+    )
+
+    org = OrganizeHandler(repo, HotSettings(), resource_store)
+    first = await org.handle(OrganizePayload(library_id=lib.id, path=str(lib_root), rebuild=True))
+    assert first.success is True
+    assert first.result is not None
+    assert first.result.organized == 1
+    dest = lib_root / "Studio" / "NSFS-039" / "NSFS-039.mp4"
+    assert dest.exists()
+    future = time.time() + 60
+    os.utime(dest, (future, future))
+    before = dest.stat().st_mtime_ns
+
+    second = await org.handle(OrganizePayload(library_id=lib.id, path=str(lib_root), rebuild=True))
+    assert second.success is True
+    assert second.result is not None
+    assert (second.result.organized, second.result.skipped) == (0, 1)
+    assert dest.stat().st_mtime_ns == before
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_organize_rebuild_reruns_when_metadata_is_newer(
+    repo: Repository, resource_store: ResourceStore, tmp_path: Path
+) -> None:
+    """metadata 比产物新 (例如重新刮削) 时, 重建要重新落盘一次."""
+    lib_root = tmp_path / "lib"
+    lib_root.mkdir()
+    src = lib_root / "incoming" / "NSFS-039.mp4"
+    src.parent.mkdir()
+    src.write_bytes(b"video")
+
+    lib = await repo.create_library(name="t", path=str(lib_root), write_nfo=False, copy_resources=[])
+    assert lib.id is not None
+    meta = await repo.upsert_metadata(number="NSFS-039", studio="Studio")
+    assert meta.id is not None
+    await repo.create_media_file(
+        lib.id, path=str(src), number="NSFS-039", status=MediaFileStatus.SCRAPED, metadata_id=meta.id
+    )
+
+    org = OrganizeHandler(repo, HotSettings(), resource_store)
+    first = await org.handle(OrganizePayload(library_id=lib.id, path=str(lib_root), rebuild=True))
+    assert first.success is True
+    assert first.result is not None
+    assert first.result.organized == 1
+    dest = lib_root / "Studio" / "NSFS-039" / "NSFS-039.mp4"
+    past = time.time() - 600
+    os.utime(dest, (past, past))
+
+    await repo.upsert_metadata(number="NSFS-039", studio="Studio", title="new title")
+    second = await org.handle(OrganizePayload(library_id=lib.id, path=str(lib_root), rebuild=True))
+    assert second.success is True
+    assert second.result is not None
+    assert (second.result.organized, second.result.skipped) == (1, 0)
+    assert dest.exists()

@@ -2,6 +2,7 @@ import re
 import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -9,7 +10,7 @@ from uuid import uuid4
 import structlog
 
 from ..config import HotSettings, WatermarkConfig
-from ..db.models import Library, MediaFile
+from ..db.models import Library, MediaFile, Metadata
 from ..db.repo_types import MediaFileUpdates
 from ..enums import ActorGender, DownloadableResource, LinkMode
 from ..library import MEDIA_EXTENSIONS, LibraryFileKind, LibraryScan, ancestor_dirs, prune_empty_dirs
@@ -326,6 +327,8 @@ def _write_into_library(source: Path, target: Path) -> None:
 
 
 _FIXED_PRODUCT_NAMES = frozenset({"poster.jpg", "thumb.jpg", "fanart.jpg", "trailer.mp4", "movie.nfo", "tvshow.nfo"})
+# 判定「条目有没有变化」时只把这几类后缀算作本工具的产物; 字幕等由整理另写, 不参与判定.
+_MANAGED_SUFFIXES = MEDIA_EXTENSIONS | {".nfo"}
 
 
 def _resolved(path: Path) -> Path:
@@ -355,6 +358,86 @@ def _same_path(left: Path, right: Path) -> bool:
     return path_is_under(left, right) and path_is_under(right, left)
 
 
+def _utc_naive(timestamp: float) -> datetime:
+    """文件 mtime 换成与 ``Metadata.updated_at`` 同一口径 (UTC, naive)."""
+    return datetime.fromtimestamp(timestamp, tz=UTC).replace(tzinfo=None)
+
+
+def _image_products(
+    paths: ResolvedPaths,
+    sources: dict[DownloadableResource, Path],
+    *,
+    content_type: ContentType,
+    config: HotSettings,
+) -> set[Path]:
+    """本轮会写出的封面 / 海报 / 剧照 / 预告片路径; 没有源的一律不计, 免得永远判成「缺文件」."""
+    products: set[Path] = set()
+    if DownloadableResource.thumb in sources:
+        products.add(_resolved(paths.thumb))
+        products.add(_resolved(paths.fanart))
+    poster = DownloadableResource.poster in sources
+    if not poster and DownloadableResource.thumb in sources:
+        poster = config.scraping.crop_poster and allows_poster_crop(content_type)
+    if poster:
+        products.add(_resolved(paths.poster))
+    if DownloadableResource.trailer in sources:
+        products.add(_resolved(paths.trailer))
+    return products
+
+
+async def _item_needs_rebuild(
+    expected: set[Path],
+    keep: set[Path],
+    directories: Sequence[Path],
+    metadata: Metadata,
+    library: Library,
+    *,
+    sources: dict[DownloadableResource, Path],
+    stills: Sequence[Path],
+    extrafanart_dir: Path | None,
+) -> bool:
+    """条目是否需要重建: 有残留、缺产物、或产物比 metadata / 源资源旧.
+
+    残留判定直接复用 dry-run 的清理候选; 因此「目录里多了上一轮的文件」一定算变化.
+    """
+    if not expected:
+        return True
+    stale = await _purge_item_dirs(
+        directories,
+        metadata.number,
+        keep | expected,
+        library_root=Path(library.path),
+        dry_run=True,
+    )
+    if any(path.suffix.casefold() in _MANAGED_SUFFIXES for path in stale):
+        return True
+    oldest: float | None = None
+    for path in expected:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return True
+        oldest = mtime if oldest is None else min(oldest, mtime)
+    stamp = metadata.updated_at
+    for source in sources.values():
+        try:
+            stamp = max(stamp, _utc_naive(source.stat().st_mtime))
+        except OSError:
+            return True
+    if stills:
+        if extrafanart_dir is None:
+            return True
+        try:
+            files = [child for child in extrafanart_dir.iterdir() if child.is_file()]
+        except OSError:
+            return True
+        if len(files) != len(stills):
+            return True
+        for child in files:
+            oldest = child.stat().st_mtime if oldest is None else min(oldest, child.stat().st_mtime)
+    return oldest is not None and stamp > _utc_naive(oldest)
+
+
 @in_thread
 def _purge_item_dirs(
     directories: Sequence[Path],
@@ -363,12 +446,14 @@ def _purge_item_dirs(
     *,
     extrafanart_dirs: Sequence[Path] = (),
     library_root: Path | None = None,
+    dry_run: bool = False,
 ) -> list[Path]:
-    """清掉这些目录里能确定属于本条目的旧产物; 返回被删的路径.
+    """清掉这些目录里能确定属于本条目的旧产物; 返回被删 (或将被删) 的路径.
 
     只删两类普通文件: 名字以番号开头的 (换版后多出来的 CD / 集数文件、旧 NFO 与链接),
     以及条目独占目录里的固定产物名; 剧照目录里的文件可整体清理. 不递归子目录、不删目录,
     库根与回收目录一律跳过, ``keep`` 里的路径始终保留 — 共享祖先目录因此不会被清空.
+    ``dry_run`` 只列候选, 不落删, 供「条目有没有变化」的判定复用.
     """
     removed: list[Path] = []
     seen: set[Path] = set()
@@ -401,9 +486,11 @@ def _purge_item_dirs(
             if not any_file and not _starts_with_number(child.name, number):
                 if not (dedicated and child.name.casefold() in _FIXED_PRODUCT_NAMES):
                     continue
+            removed.append(child)
+            if dry_run:
+                continue
             try:
                 child.unlink(missing_ok=True)
-                removed.append(child)
             except OSError as exc:
                 logger.warning("rebuild cleanup skipped", path=str(child), error=str(exc))
 
@@ -588,20 +675,52 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
             return [mf for mf in indexed if path_is_under(mf.path, payload.path)]
         return indexed
 
+    async def _product_sources(
+        self,
+        metadata: Metadata,
+        kinds: set[DownloadableResource],
+    ) -> tuple[dict[DownloadableResource, Path], list[Path]]:
+        """取本轮会用来落盘的本地文件; 只解析已有资源, 不发起下载.
+
+        判定「条目有没有变化」时, 资源缺失意味着产物本来就写不出来, 不该据此判成变化.
+        """
+        sources: dict[DownloadableResource, Path] = {}
+        for kind, urls in (
+            (DownloadableResource.thumb, metadata.thumb_urls),
+            (DownloadableResource.poster, metadata.poster_urls),
+            (DownloadableResource.trailer, metadata.trailer_urls),
+        ):
+            if kind not in kinds:
+                continue
+            for url in urls:
+                path = await self._resource_store.resolve(url)
+                if path is not None:
+                    sources[kind] = path
+                    break
+        stills: list[Path] = []
+        if DownloadableResource.extrafanart in kinds:
+            for urls in metadata.extrafanart_urls.values():
+                resolved = [await self._resource_store.resolve(url) for url in urls]
+                if resolved and all(path is not None for path in resolved):
+                    stills = [path for path in resolved if path is not None]
+                    break
+        return sources, stills
+
     async def _rebuild_items(
         self,
         live: list[MediaFile],
         library: Library,
         payload: OrganizePayload,
-    ) -> None:
-        """重建前按条目清掉上一轮产物.
+    ) -> list[MediaFile]:
+        """重建前按条目清掉上一轮产物; 没有变化的条目整条跳过.
 
-        ``keep`` 收集同条目所有仍在磁盘上的成员源文件, 以及本轮不会重写的 NFO / 预告片;
-        源文件已不存在的旧成员不保留, 它留下的产物随目录一起被清掉.
+        先按条目整体处理, 避免多 CD 条目逐文件清理时互相删掉对方产物. ``keep`` 收集同条目
+        所有仍在磁盘上的成员源文件, 以及本轮不会重写的 NFO / 预告片; ``expected`` 是本轮应该
+        写出的文件, 用来判断「缺了什么、多了什么、哪个比源旧」. 判为未变的条目不再进入整理循环.
         """
         metadata_ids = sorted({mf.metadata_id for mf in live if mf.metadata_id is not None})
         if not metadata_ids:
-            return
+            return live
         members_by_metadata: dict[int, list[MediaFile]] = {}
         for member in await self._repo.list_media_files(metadata_ids=metadata_ids, limit=None):
             if member.metadata_id is not None:
@@ -610,6 +729,7 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
         write_nfo = library.write_nfo if payload.write_nfo is None else payload.write_nfo
         copy_resources = library.copy_resources if payload.copy_resources is None else payload.copy_resources
         kinds = set(copy_resources) if copy_resources is not None else set(DownloadableResource)
+        unchanged: set[int] = set()
         for metadata_id, members in members_by_metadata.items():
             if not any(member.id in live_ids for member in members):
                 continue
@@ -617,8 +737,10 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
             if metadata is None:
                 continue
             keep: set[Path] = set()
+            expected: set[Path] = set()
             directories: list[Path] = []
             extrafanart_dirs: list[Path] = []
+            live_paths: ResolvedPaths | None = None
             for member in members:
                 source = await existing_disk_path(Path(member.path), follow_symlinks=False)
                 if source is None:
@@ -635,6 +757,15 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                     safe_dirs=self._safe_dirs,
                 )
                 directories.append(paths.video.parent)
+                if member.id in live_ids:
+                    expected.add(
+                        _resolved(video_dest(paths.video.parent, paths.video.stem, source, suffix=paths.video.suffix))
+                    )
+                    if paths.link is not None:
+                        expected.add(_resolved(paths.link))
+                    if write_nfo:
+                        expected.add(_resolved(paths.nfo))
+                    live_paths = live_paths or paths
                 if paths.link is not None:
                     directories.append(paths.link.parent)
                     if member.id not in live_ids:
@@ -645,10 +776,32 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                     keep.add(_resolved(paths.trailer))
                 if DownloadableResource.extrafanart in kinds:
                     extrafanart_dirs.append(paths.extrafanart_dir)
+            sources, stills = await self._product_sources(metadata, kinds)
+            if live_paths is not None:
+                expected.update(
+                    _image_products(
+                        live_paths,
+                        sources,
+                        content_type=metadata.content_type,
+                        config=self._config,
+                    )
+                )
+            if not await _item_needs_rebuild(
+                expected,
+                keep,
+                directories,
+                metadata,
+                library,
+                sources=sources,
+                stills=stills,
+                extrafanart_dir=live_paths.extrafanart_dir if live_paths is not None else None,
+            ):
+                unchanged.add(metadata_id)
+                continue
             removed = await _purge_item_dirs(
                 directories,
                 metadata.number,
-                keep,
+                keep | expected,
                 extrafanart_dirs=extrafanart_dirs,
                 library_root=Path(library.path),
             )
@@ -658,6 +811,9 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                     number=metadata.number,
                     removed=[str(path) for path in removed],
                 )
+        if unchanged:
+            logger.info("organize rebuild skipped unchanged items", count=len(unchanged))
+        return [mf for mf in live if mf.metadata_id not in unchanged]
 
     async def handle(self, payload: OrganizePayload) -> TaskResult[OrganizeResult]:
         library = await self._repo.get_library(payload.library_id)
@@ -717,12 +873,15 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
         conflicted = 0
         conflicts: list[OrganizeConflict] = []
         failed = 0
-        total = len(live)
         # 只有移动方式会移走源文件, 复制 / 硬链接 / 符号链接不腾空目录.
         prune_candidates: set[Path] = set()
         collect_prune = payload.prune_empty_dirs and library.move_mode is MoveMode.MOVE
         if payload.rebuild and live:
-            await self._rebuild_items(live, library, payload)
+            before = len(live)
+            live = await self._rebuild_items(live, library, payload)
+            # 内容没变的条目整条跳过, 不重写任何产物; 计数并入 skipped 让用户看到「没动」.
+            skipped += before - len(live)
+        total = len(live)
         if total == 0:
             await self.report_progress(1, 1, "done")
         else:
