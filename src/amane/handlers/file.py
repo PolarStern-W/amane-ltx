@@ -358,9 +358,9 @@ def _same_path(left: Path, right: Path) -> bool:
     return path_is_under(left, right) and path_is_under(right, left)
 
 
-def _utc_naive(timestamp: float) -> datetime:
-    """文件 mtime 换成与 ``Metadata.updated_at`` 同一口径 (UTC, naive)."""
-    return datetime.fromtimestamp(timestamp, tz=UTC).replace(tzinfo=None)
+def _epoch(moment: datetime) -> float:
+    """datetime 归一成 epoch 秒; ``Metadata.updated_at`` 可能带时区, 比较只用数字就不必猜口径."""
+    return moment.replace(tzinfo=UTC).timestamp() if moment.tzinfo is None else moment.timestamp()
 
 
 def _image_products(
@@ -437,10 +437,10 @@ async def _item_needs_rebuild(
         except OSError:
             return True
         oldest = mtime if oldest is None else min(oldest, mtime)
-    stamp = metadata.updated_at
+    stamp = _epoch(metadata.updated_at)
     for source in sources.values():
         try:
-            stamp = max(stamp, _utc_naive(source.stat().st_mtime))
+            stamp = max(stamp, source.stat().st_mtime)
         except OSError:
             return True
     if stills:
@@ -454,7 +454,7 @@ async def _item_needs_rebuild(
             return True
         for child in files:
             oldest = child.stat().st_mtime if oldest is None else min(oldest, child.stat().st_mtime)
-    return oldest is not None and stamp > _utc_naive(oldest)
+    return oldest is not None and stamp > oldest
 
 
 @in_thread
