@@ -55,6 +55,15 @@ jobs:
           git checkout -B ltx origin/ltx
           git merge main --no-edit
 
+      - name: Realign migration heads
+        if: steps.ltxmerge.outcome == 'success'
+        run: |
+          python3 .github/scripts/realign-migration-heads.py
+          if ! git diff --quiet; then
+            git add -A
+            git commit -m "chore(migrations): 迁移图重新接到上游 head"
+          fi
+
       - name: Push ltx
         if: steps.ltxmerge.outcome == 'success'
         run: git push origin ltx
