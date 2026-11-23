@@ -1,7 +1,7 @@
 """split ltx media file mosaic from cracked
 
 Revision ID: eb1e988cf252
-Revises: e06def65f72a
+Revises: dc04a8ae624e
 Create Date: 2026-11-13 21:37:00.689941
 
 文件名 `-LTX` 现为独立的 LTX 标记, 不再并入「破解」. 按当前 parse_file_info 重算这类行
@@ -19,7 +19,7 @@ from amane.parsing import parse_file_info
 
 # revision identifiers, used by Alembic.
 revision: str = "eb1e988cf252"
-down_revision: str | None = "e06def65f72a"
+down_revision: str | None = "dc04a8ae624e"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
