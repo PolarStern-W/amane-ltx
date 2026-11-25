@@ -167,6 +167,12 @@ class OrganizePayload(LibraryBase):
             "mediainfo 之类的附属文件不参与「有没有变化」的判定. 文件集合与产物都没变化的条目整条跳过"
         ),
     )
+    rebuild_limit: int = Field(
+        default=0,
+        ge=0,
+        le=5000,
+        description="重建时单次任务最多处理多少个条目, 0 表示不限; 存储不稳时可调小, 剩下的下次再跑",
+    )
 
     async def resolve(self, repo: Repository) -> None:
         if self.media_file_ids is not None and self.path:

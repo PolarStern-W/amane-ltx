@@ -251,6 +251,10 @@
       "rebuild": {
         "label": "Rebuild",
         "description": "When an item changed, wipe its folder and redo it — old files, artwork, NFO and links, plus side files written by other tools such as mediainfo — then write every source file of the item again, all parts restored together. Only a folder named after the number is wiped whole; in a shared folder only files starting with the number are removed. Items whose file set and products are unchanged are skipped, and side files like mediainfo never count as a change"
+      },
+      "rebuild_limit": {
+        "label": "Rebuild limit",
+        "description": "How many items one rebuild run may process; 0 means no limit. Lower it when storage is flaky; the rest waits for the next run"
       }
     },
     "scrape": {

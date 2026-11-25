@@ -3486,6 +3486,12 @@ export type OrganizeSubmission = {
      */
     rebuild?: boolean;
     /**
+     * Rebuild Limit
+     *
+     * 重建时单次任务最多处理多少个条目, 0 表示不限; 存储不稳时可调小, 剩下的下次再跑
+     */
+    rebuild_limit?: number;
+    /**
      * Type
      */
     type: 'organize';

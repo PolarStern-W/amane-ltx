@@ -13608,6 +13608,14 @@
             "description": "重建: 条目有变化时把它的目录清空重做 — 旧版留下的 CD / 集数文件、剧照、NFO、链接, 以及别的工具写进来的 mediainfo 等附属文件一并删除, 再按该条目当前的全部源文件重新写入 (分集一起补齐). 只对按番号命名的条目目录整目录清空, 摊平在共享目录里时只删以番号开头的文件; 不碰库根与回收站, 仍在盘上的源文件保留. mediainfo 之类的附属文件不参与「有没有变化」的判定. 文件集合与产物都没变化的条目整条跳过",
             "default": false
           },
+          "rebuild_limit": {
+            "type": "integer",
+            "maximum": 5000,
+            "minimum": 0,
+            "title": "Rebuild Limit",
+            "description": "重建时单次任务最多处理多少个条目, 0 表示不限; 存储不稳时可调小, 剩下的下次再跑",
+            "default": 0
+          },
           "type": {
             "type": "string",
             "const": "organize",

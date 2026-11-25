@@ -1,5 +1,7 @@
+import errno
 import re
 import shutil
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -319,6 +321,36 @@ async def _acquire_first_local(urls: list[str], store: ResourceStore, client: We
     return None
 
 
+# 部分 NAS 的存储层 (网络重挂载、回环文件系统) 会在删除风暴后让 rename 短暂失败,
+# 退避重试通常就能过去; 仍失败则退化为直接覆盖写, 不再依赖 rename.
+_REPLACE_RETRY_ERRNOS = frozenset({errno.EBADMSG, errno.EBUSY, errno.EAGAIN, errno.EINTR, errno.ETXTBSY})
+_REPLACE_ATTEMPTS = 3
+_REPLACE_BACKOFF_SECONDS = 0.4
+
+
+def _replace_with_retry(tmp: Path, target: Path) -> None:
+    """把临时文件改名到目标; 存储层抖动时退避重试, 最终退化为直接覆盖写."""
+    delay = _REPLACE_BACKOFF_SECONDS
+    last: OSError | None = None
+    for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+        try:
+            tmp.replace(target)
+            return
+        except OSError as exc:
+            if exc.errno not in _REPLACE_RETRY_ERRNOS:
+                raise
+            last = exc
+            logger.warning("library rename retried", target=str(target), attempt=attempt, error=str(exc))
+            time.sleep(delay)
+            delay *= 2
+    try:
+        shutil.copyfile(tmp, target)
+    except OSError as exc:
+        logger.error("library write failed", target=str(target), error=str(exc))
+        raise
+    logger.warning("library write fell back to overwrite", target=str(target), error=str(last))
+
+
 def _write_into_library(source: Path, target: Path) -> None:
     """按新文件落盘库内产物: 模式位与 ACL 由目标目录决定, 不继承源文件.
 
@@ -329,10 +361,11 @@ def _write_into_library(source: Path, target: Path) -> None:
     tmp = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
     try:
         shutil.copyfile(source, tmp)
-        tmp.replace(target)
     except OSError as exc:
         logger.error("library write failed", source=str(source), target=str(target), error=str(exc))
         raise
+    try:
+        _replace_with_retry(tmp, target)
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -445,6 +478,7 @@ async def _item_needs_rebuild(
         keep | expected,
         extrafanart_dirs=extrafanart_dirs,
         library_root=Path(library.path),
+        preserve=expected,
         dry_run=True,
     )
     if any(_affects_rebuild(path, extrafanart_dirs) for path in stale):
@@ -489,6 +523,7 @@ def _purge_item_dirs(
     *,
     extrafanart_dirs: Sequence[Path] = (),
     library_root: Path | None = None,
+    preserve: set[Path] | frozenset[Path] | None = None,
     dry_run: bool = False,
 ) -> list[Path]:
     """清空这些目录里属于本条目的东西; 返回被删 (或将被删) 的路径.
@@ -501,6 +536,7 @@ def _purge_item_dirs(
     removed: list[Path] = []
     seen: set[Path] = set()
     dropped: set[Path] = set()
+    preserved = preserve or frozenset()
     trash_root = library_root / TRASH_DIRNAME if library_root is not None else None
 
     def protected(path: Path) -> bool:
@@ -554,6 +590,14 @@ def _purge_item_dirs(
             return
         for child in children:
             if protected(child):
+                continue
+            if (
+                whole_dir
+                and child.is_file()
+                and child.name.casefold() in _FIXED_PRODUCT_NAMES
+                and _resolved(child) in preserved
+            ):
+                # 本轮确实要重写的固定名产物不预删 (写入时直接覆盖), 免得删了却没写回来.
                 continue
             if not whole_dir and (child.is_dir() or not _starts_with_number(child.name, number)):
                 continue
@@ -881,6 +925,17 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                 expected=frozenset(expected),
             )
             rebuilt_members[metadata_id] = present
+        if payload.rebuild_limit and len(plans) > payload.rebuild_limit:
+            order: list[int] = []
+            for media_file in live:
+                metadata_id = media_file.metadata_id
+                if metadata_id is not None and metadata_id in plans and metadata_id not in order:
+                    order.append(metadata_id)
+            allowed = set(order[: payload.rebuild_limit])
+            for metadata_id in [key for key in plans if key not in allowed]:
+                plans.pop(metadata_id)
+                unchanged.add(metadata_id)
+            logger.info("organize rebuild limited", limit=payload.rebuild_limit, deferred=len(order) - len(allowed))
         if unchanged:
             logger.info("organize rebuild skipped unchanged items", count=len(unchanged))
         ordered = [mf for mf in live if mf.metadata_id not in unchanged]
@@ -993,6 +1048,7 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
                         set(plan.keep),
                         extrafanart_dirs=plan.extrafanart_dirs,
                         library_root=library_root,
+                        preserve=set(plan.expected),
                     )
                     if removed:
                         logger.info(
@@ -1004,18 +1060,25 @@ class OrganizeHandler(TaskHandler[OrganizePayload, OrganizeResult]):
 
                 write_nfo = library.write_nfo if payload.write_nfo is None else payload.write_nfo
                 copy_resources = library.copy_resources if payload.copy_resources is None else payload.copy_resources
-                fop_result = await apply_file_operations(
-                    self._repo,
-                    media_file.id,
-                    metadata,
-                    self._config,
-                    self._resource_store,
-                    write_nfo=write_nfo,
-                    copy_resources=copy_resources,
-                    web_client=self._web_client,
-                    safe_dirs=self._safe_dirs,
-                    watermark_dir=self._watermark_dir,
-                )
+                try:
+                    fop_result = await apply_file_operations(
+                        self._repo,
+                        media_file.id,
+                        metadata,
+                        self._config,
+                        self._resource_store,
+                        write_nfo=write_nfo,
+                        copy_resources=copy_resources,
+                        web_client=self._web_client,
+                        safe_dirs=self._safe_dirs,
+                        watermark_dir=self._watermark_dir,
+                    )
+                except Exception as exc:
+                    # 单条目落盘失败只记一次失败, 不能让整库任务一起崩掉.
+                    logger.exception("organize item failed", path=path_str, error=str(exc))
+                    failed += 1
+                    await self.report_progress(i, total, file_path.name)
+                    continue
                 if fop_result is None:
                     skipped += 1
                     await self.report_progress(i, total, file_path.name)
